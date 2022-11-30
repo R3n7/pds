@@ -1,0 +1,1512 @@
+1D-STENCIL:
+#include <cuda_runtime.h>
+#include<stdio.h>
+#include<sys/time.h>
+
+#define RADIUS 4
+#define BDIM 8
+
+// constant memory
+__constant__ float coef[RADIUS + 1];
+
+/*
+// FD coeffecient
+#define a0     0.00000f
+#define a1     0.80000f
+#define a2    -0.20000f
+#define a3     0.03809f
+#define a4    -0.00357f
+*/
+
+#define a0 0
+#define a1 1
+#define a2 2
+#define a3 3
+#define a4 4
+
+double cpuSecond(){
+        struct timeval tp;
+        gettimeofday(&tp, NULL);
+        return ((double)tp.tv_sec + (double)tp.tv_usec*1.e-6);
+}
+
+void initialData(float *in,  const int size)
+{
+    for (int i = 0; i < size; i++)
+    {
+//        in[i] = (float)(rand() & 0xFF) / 100.0f;
+in[i]=i+1;
+    }
+}
+
+void printData(float *in,  const int size)
+{
+    for (int i = RADIUS; i < size; i++)
+    {
+        printf("%f ", in[i]);
+    }
+
+    printf("\n");
+}
+
+void cpu_stencil_1d (float *in, float *out, int isize)
+{
+    for (int i = RADIUS; i <= isize; i++)
+    {
+        float tmp = a1 * (in[i + 1] - in[i - 1])
+                    + a2 * (in[i + 2] - in[i - 2])
+                    + a3 * (in[i + 3] - in[i - 3])
+                    + a4 * (in[i + 4] - in[i - 4]);
+        out[i] = tmp;
+    }
+}
+
+
+__global__ void stencil_1d(float *in, float *out, int N)
+{
+    // shared memory
+    __shared__ float smem[BDIM + 2 * RADIUS];
+
+    // index to global memory
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+        // index to shared memory for stencil calculatioin
+        int sidx = threadIdx.x + RADIUS;
+
+        // Read data from global memory into shared memory
+        smem[sidx] = in[idx];
+printf("\nsmem[%d]=in[%d] by %d, value is %f",sidx,idx,threadIdx.x,in[idx]);
+__syncthreads();
+        // read halo part to shared memory
+        if (threadIdx.x < RADIUS)
+        {
+            smem[sidx - RADIUS] = in[idx - RADIUS];
+            smem[sidx + BDIM] = in[idx + BDIM];
+printf("\nsmem[%d]=in[%d] by %d, value is %f",sidx-RADIUS,idx-RADIUS,threadIdx.x,in[idx-RADIUS]);
+printf("\nsmem[%d]=in[%d] by %d,value is %f",sidx+BDIM,idx+BDIM,threadIdx.x,in[idx+BDIM]);
+        }
+
+        // Synchronize (ensure all the data is available)
+        __syncthreads();
+
+        // Apply the stencil
+        float tmp = 0.0f;
+#pragma unroll
+        for (int i = 1; i <= RADIUS; i++)
+        {
+            tmp += coef[i] * (smem[sidx + i] - smem[sidx - i]);
+        }
+
+        // Store the result
+        out[idx] = tmp;
+printf("\nin[%d] is %f",idx,in[threadIdx.x]);
+printf("\nout[%d] = %f by %d", idx,tmp,threadIdx.x);
+}
+
+int main(int argc, char **argv)
+{
+    // set up device
+    int dev = 0;
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, dev);
+    printf("%s starting transpose at ", argv[0]);
+    printf("device %d: %s ", dev, deviceProp.name);
+    cudaSetDevice(dev);
+
+    // set up data size
+    int isize = 1 << 3;
+
+    size_t nBytes = (isize + 2 * RADIUS) * sizeof(float);
+    printf("array size: %d ", isize);
+
+    bool iprint = 1;
+
+    // allocate host memory
+    float *h_in    = (float *)malloc(nBytes);
+    float *hostRef = (float *)malloc(nBytes);
+    float *gpuRef  = (float *)malloc(nBytes);
+
+    // allocate device memory
+    float *d_in, *d_out;
+    cudaMalloc((float**)&d_in, nBytes);
+    cudaMalloc((float**)&d_out, nBytes);
+
+    // initialize host array
+    initialData(h_in, isize + 2 * RADIUS);
+
+   // Copy to device
+    cudaMemcpy(d_in, h_in, nBytes, cudaMemcpyHostToDevice);
+
+    // set up constant memory
+    const float h_coef[] = {a0, a1, a2, a3, a4};
+    cudaMemcpyToSymbol( coef, h_coef, (RADIUS + 1) * sizeof(float));
+
+    // launch configuration
+    cudaDeviceProp info;
+    cudaGetDeviceProperties(&info, 0);
+    dim3 block(BDIM, 1);
+    dim3 grid(info.maxGridSize[0] < isize / block.x ? info.maxGridSize[0] :
+            isize / block.x, 1);
+    printf("(grid, block) %d,%d \n ", grid.x, block.x);
+    double istart = cpuSecond();
+    // Launch stencil_1d() kernel on GPU
+    stencil_1d<<<1, 8>>>(d_in + RADIUS, d_out + RADIUS, isize);
+    double ielapsed = cpuSecond() - istart;
+    // Copy result back to host
+    cudaMemcpy(gpuRef, d_out, nBytes, cudaMemcpyDeviceToHost);
+
+    // apply cpu stencil
+    double cpustart = cpuSecond();
+    cpu_stencil_1d(h_in, hostRef, isize);
+    double cpuelapsed = cpuSecond() - cpustart;
+    // print out results
+    if(iprint)
+    { printf("\nisize is %d\n",isize);
+        printData(gpuRef, isize);
+    //    printData(hostRef, isize);
+    }
+    printf("GPU Elapsed Time %lf\n",ielapsed);
+    printf("CPU Elapsed Time %lf\n",cpuelapsed);
+    // Cleanup
+    cudaFree(d_in);
+    cudaFree(d_out);
+    free(h_in);
+    free(hostRef);
+    free(gpuRef);
+
+    // reset device
+    cudaDeviceReset();
+    return EXIT_SUCCESS;
+}
+DOT_Product:
+#include<stdio.h>
+#include<cuda.h>
+
+__global__ void dot(int *a, int *b, int *c, int nx, int ny)
+{
+  int k = threadIdx.x;
+  c[k] = a[k] * b[k];
+}
+
+__global__ void red(int * c)
+{
+  int t = threadIdx.x;
+  printf("%d",blockDim.x);
+  for(int a = 1; a < blockDim.x; a *= 2)
+  {
+    if(t % ( 2*a) == 0 && t+a < blockDim.x)
+    {
+      c[t] += c[t+a];
+    }
+  }
+}
+
+int main()
+{
+  int a[4] = {1, 2, 3, 4};
+  int b[4] = {1, 2, 3, 4};
+  int c[4] = {0, 0, 0, 0};
+
+  int *da, *db, *dc, size = 4*sizeof(int);
+  cudaMalloc((void **) & da, size);
+  cudaMemcpy(da, a, size, cudaMemcpyHostToDevice);
+  cudaMalloc((void **)&db, size);
+  cudaMemcpy(db, b, size, cudaMemcpyHostToDevice);
+  cudaMalloc((void **)&dc, size);
+  cudaMemcpy(dc, c, size, cudaMemcpyHostToDevice);
+  dot<<<1,4>>>(da, db, dc, 1, 4);
+  red<<<1,4>>>(dc);
+  cudaMemcpy(&c, dc, size, cudaMemcpyDeviceToHost);
+  printf("%d", c[0]);
+  return 0;
+}
+List Packing:
+#include<stdio.h>
+#include<cuda.h>
+#include <ctype.h>
+
+__global__ void prefixsum(int *a,int n,double logn)
+{
+    int i=threadIdx.x;
+    for (int j=0;j<logn;j++)
+    {   int cd = i-pow(2,j);
+        if(i>=pow(2,j))
+        {   
+            a[i]=a[i]+a[cd];
+        }
+    }
+}
+__global__ void pack(int *a,char *b){
+    int i=threadIdx.x;
+    if(b[i]>='A' && b[i]<='Z'){
+        b[a[i]-1]=b[i];
+    }
+}
+
+int main()
+{
+    int n;
+    printf("Enter the size of the array:\n");
+    // scanf("%d",&n);
+    n=8;
+    
+    int a[n];
+    int bc=0;
+    printf("Enter the array:\n");
+    char b[n] = {'A','B','C','D','e','f','g','H'};
+    for(int i = 0; i < n; i++)
+    {
+        //scanf("%c",&b[i]);
+        if(b[i]>='A' && b[i]<='Z'){
+            a[i]=1;
+            bc++;
+        }
+        else{
+            a[i]=0;
+        }
+    }
+    int *d_a;
+    cudaMalloc((void **)&d_a,n*sizeof(int));
+    cudaMemcpy(d_a,a,n*sizeof(int),cudaMemcpyHostToDevice);
+    char *d_b;
+    cudaMalloc((void **)&d_b,n*sizeof(char));
+    cudaMemcpy(d_b,b,n*sizeof(char),cudaMemcpyHostToDevice);
+    prefixsum<<<1,n>>>(d_a,n,log2(n));
+    cudaMemcpy(a,d_a,n*sizeof(int),cudaMemcpyDeviceToHost);
+    printf("The prefix sum of the array is:");
+    for(int i=0;i<n;i++)
+    {
+        printf("%d ",a[i]);
+    }
+    printf("\n");
+    pack<<<1,n>>>(d_a,d_b);
+    cudaMemcpy(b,d_b,n*sizeof(char),cudaMemcpyDeviceToHost);
+    printf("The packed array is:");
+    for(int i=0;i<bc;i++)
+    {
+        printf("%c ",b[i]);
+    }
+}
+Matrix Transpose:
+%%cu
+#include<stdio.h>
+#include<sys/time.h>
+
+#define N 4
+#define M 4
+#define BDIMX 2
+#define BDIMY 2
+
+__global__ void transpose(int *a, int *b) {
+        __shared__ int temp[BDIMY][BDIMX];
+        int ix = threadIdx.x + blockIdx.x * blockDim.x;
+        int iy = threadIdx.y + blockIdx.y * blockDim.y;
+        int ti = iy * N + ix;
+        int bidx = threadIdx.x + threadIdx.y * blockDim.x;
+        int irow = bidx / blockDim.y;
+        int icol = bidx % blockDim.y;
+        ix = icol + blockIdx.y * blockDim.y;
+        iy = irow + blockIdx.x * blockDim.x;
+        int to = iy * M + ix;
+        if(ix < N && iy < M) {
+                temp[threadIdx.y][threadIdx.x] = a[ti];
+                __syncthreads();
+                b[to] = temp[icol][irow];
+        }
+}
+
+double cpuSecond() {
+        struct timeval tp;
+        gettimeofday(&tp, NULL);
+        return ((double)tp.tv_sec + (double)tp.tv_usec*1.e-6);
+}
+
+int main() {
+        int *a, *b;
+        int size = N * M * sizeof(int);
+        a = (int* )malloc(size);
+        b = (int* )malloc(size);
+        for(int i = 0; i < N * M; i++) {
+                a[i] = i;
+        }
+        printf("Initial Array: \n");
+        for(int i = 0; i < N; i++) {
+                for(int j = 0; j < M; j++) {
+                        printf("%d ", a[i * M + j]);
+                }
+                printf("\n");
+        }
+
+        int *da, *db;
+        cudaMalloc((void** )&da, size);
+        cudaMalloc((void** )&db, size);
+        cudaMemcpy(da, a, size, cudaMemcpyHostToDevice);
+        dim3 block(BDIMX, BDIMY);
+        dim3 grid(2, 2);
+        double istart = cpuSecond();
+        transpose<<<grid, block>>>(da, db);
+        cudaDeviceSynchronize();
+        double ielapsed = cpuSecond() - istart;
+        cudaMemcpy(b, db, size, cudaMemcpyDeviceToHost);
+        printf("Final Array: \n");
+        for(int i = 0; i < N; i++) {
+                for(int j = 0; j < M; j++) {
+                        printf("%d ", b[i * M + j]);
+                }
+                printf("\n");
+        }
+        printf("Elapsed Time : %lf\n", ielapsed);
+}
+oddeven:
+#include<stdio.h>
+#define n 8
+__global__ void sort(int *a)
+{
+    int i=threadIdx.x;
+  for(int j=0;j<n;j++)
+  {
+    if(j%2==0 && (i*2+1)<n)
+    {
+      if(a[2*i]>a[2*i+1])
+      {
+        int temp=a[2*i];
+        a[2*i]=a[2*i+1];
+        a[2*i+1]=temp;
+      }
+    }
+    if(j%2==1 && (2*i+2)<n)
+    {
+      if(a[2*i+1]>a[2*i+2])
+      {
+        int temp=a[2*i+1];
+        a[2*i+1]=a[2*i+2];
+        a[2*i+2]=temp;
+      }
+    }
+  }
+}
+int main()
+{
+  int a[n]={2,1,4,9,5,3,6,10};
+  int *da;
+  cudaMalloc((void**)&da,n*sizeof(int));
+  cudaMemcpy(da,&a,n*sizeof(int),cudaMemcpyHostToDevice);
+  sort<<<1,n>>>(da);
+  cudaMemcpy(&a,da,n*sizeof(int),cudaMemcpyDeviceToHost);
+  printf("Sorted Order: ");
+  for(int i=0;i<n;i++)
+    printf("%d ",a[i]);
+  return 0;
+}
+quicksort:
+#include<stdio.h>
+#include<time.h>
+
+#define N 20
+
+void initialize(int *a) {
+        for(int i = 0; i < N; i++) {
+                a[i] = rand() % (100 - 10 + 1) + 10;
+        }
+}
+
+__device__ int d_size;
+
+__global__ void partition(int *arr, int *lstack, int *hstack, int n) {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        d_size = 0;
+        __syncthreads();
+        if(idx < n) {
+                int h = hstack[idx], l = lstack[idx], x = arr[h], i = l - 1;
+                int temp;
+                for(int j = l; j < h; j++) {
+                        if(arr[j] <= x) {
+                                i++;
+                                temp = arr[i];
+                                arr[i] = arr[j];
+                                arr[j] = temp;
+                        }
+                }
+                temp = arr[i + 1];
+                arr[i + 1] = arr[h];
+                arr[h] = temp;
+                int p = i + 1;
+                if(p - 1 > l) {
+                        int ind = atomicAdd(&d_size, 1);
+                        lstack[ind] = l;
+                        hstack[ind] = p - 1;
+                }
+                if(p + 1 < h) {
+                        int ind = atomicAdd(&d_size, 1);
+                        lstack[ind] = p + 1;
+                        hstack[ind] = h;
+                }
+        }
+}
+
+void quickSort(int *arr) {
+        int low = 0, high = N - 1;
+        int lstack[high - low + 1], hstack[high - low + 1];
+        int top = -1, *da, *dl, *dh, size = (high - low + 1) * sizeof(int);
+        lstack[++top] = low;
+        hstack[top] = high;
+
+        cudaMalloc(&da, size);
+        cudaMemcpy(da, arr, size, cudaMemcpyHostToDevice);
+
+        cudaMalloc(&dl, size);
+        cudaMemcpy(dl, lstack, size, cudaMemcpyHostToDevice);
+
+        cudaMalloc(&dh, size);
+        cudaMemcpy(dh, hstack, size, cudaMemcpyHostToDevice);
+
+        int nt, nb, ni;
+        nt = nb = ni = 1;
+
+        while(ni > 0) {
+                partition<<<nb, nt>>>(da, dl, dh, ni);
+                int ans;
+                cudaMemcpyFromSymbol(&ans, d_size, sizeof(int),0, cudaMemcpyDeviceToHost);
+                if(ans < N * nt) {
+                        nt = ans;
+                }
+                else {
+                        nt = N * nt;
+                        nb = ans / nt + (ans % nt == 0 ? 0 : 1);
+                }
+                ni = ans;
+                cudaMemcpy(arr, da, (high - low + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+        }
+}
+
+int main() {
+        int *a = (int* )malloc(N * sizeof(int));
+        initialize(a);
+        quickSort(a);
+        for(int i = 0; i < N; i++) {
+                printf("%d ", a[i]);
+        }
+        printf("\n");
+}
+parallel reduction:
+#include<cuda.h>
+#include<stdio.h>
+
+__global__ void pararedn(int* a)
+{
+  int t = threadIdx.x;
+  for(int j = 1; j < blockDim.x; j*=2)
+  {
+    if(t % (2*j) == 0 && (t+j) < blockDim.x)
+    {
+      a[t] = a[t] + a[t+j];
+    }
+    //printf("%d ", a[t]);
+  }
+}
+
+int main() 
+{
+  int arr[10];
+  for(int i = 0; i < 10; i++) 
+  {
+    arr[i] = i+1;
+  }
+  for(int i = 0; i < 10; i++)
+  {
+    printf("%d ", arr[i]);
+  }
+  int *in;
+  cudaMalloc((void**)&in, 10*sizeof(int));
+  cudaMemcpy(in, &arr, 10 * sizeof(int), cudaMemcpyHostToDevice);
+  //cudaMemcpy(out, &sol, 6 * sizeof(int), cudaMemcpyHostToDevice);
+  printf("before call\n");
+  pararedn<<<1, 10>>>(in);
+  printf("after call\n");
+  cudaMemcpy(&arr, in, 10*sizeof(int), cudaMemcpyDeviceToHost);
+  printf("%d \n", arr[0]);
+  cudaFree(in);
+  //cudaFree(out);
+}
+prefixsum:
+#include<stdio.h>
+#include<cuda.h>
+
+__global__ void prefixsum(int *a,int n,double logn)
+{
+    int i=threadIdx.x;
+    for (int j=0;j<logn;j++)
+    {   int cd = i-pow(2,j);
+        if(i>=pow(2,j))
+        {   
+            a[i]=a[i]+a[cd];
+        }
+    }
+}
+
+int main()
+{
+    int n;
+    printf("Enter the number of elements in the array:");
+    scanf("%d",&n);
+    int a[n];
+    printf("Enter the elements of the array:\n");
+    for(int i=0;i<n;i++)
+    {
+        scanf("%d",&a[i]);
+    }
+    int *d_a;
+    double x = log(n)/log(2);
+    cudaMalloc((void **)&d_a,n*sizeof(int));
+    cudaMemcpy(d_a,a,n*sizeof(int),cudaMemcpyHostToDevice);
+    prefixsum<<<1,n>>>(d_a,n,x);
+    cudaMemcpy(a,d_a,n*sizeof(int),cudaMemcpyDeviceToHost);
+    printf("The prefix sum of the array is:");
+    for(int i=0;i<n;i++)
+    {
+        printf("%d ",a[i]);
+    }
+    printf("\n");
+    cudaFree(d_a);
+    return 0;
+}
+preeordertraversal:
+#include<stdio.h>
+#define N 8
+__device__ struct point {
+        int x;
+        int y;
+};
+
+__device__ struct point succ[N][N];
+__device__ int position[N][N];
+
+__global__ void preorder(int *parent, int *sibling, int *child, int *adj, int *preo) {
+        int i = threadIdx.x;
+        int j = threadIdx.y;
+        int gind = j*N+i;
+        if(adj[gind]==1) {
+                 printf("Edge (%d, %d)\n",i, j);
+                if(parent[i] == j) {
+                        if(sibling[i]!=(-1)) {
+                                struct point pt;
+                                pt.x = j;
+                                pt.y = sibling[i];
+                                succ[i][j] = pt;
+                        }
+                        else if(parent[j]!=(-1)) {
+                                 struct point pt;
+                                pt.x = j;
+                                pt.y = parent[j];
+                                succ[i][j] = pt;
+                        }
+                        else {
+                                 struct point pt;
+                                pt.x = i;
+                                pt.y = j;
+                                succ[i][j] = pt;
+                                preo[j] = 1;
+                        }
+                }
+                else {
+                        if(child[j]!=(-1)) {
+                                 struct point pt;
+                                pt.x = j;
+                                pt.y = child[j];
+                                succ[i][j] = pt;
+                        }
+                        else {
+                                 struct point pt;
+                                pt.x = j;
+                                pt.y = i;
+                                succ[i][j] = pt;
+                        }
+			}
+                __syncthreads();
+                if(parent[i]==j) position[i][j] = 0;
+                else position[i][j] = 1;
+                int logval = (int)ceil(log2((double)(2*(N-1))));
+                printf("Successor of (%d, %d) = (%d, %d)\n",i, j, succ[i][j].x, succ[i][j].y);
+
+                for(int k=1; k<=logval; k++) {
+                        __syncthreads();
+                        struct point pt = succ[i][j];
+                        position[i][j] = position[i][j]+position[pt.x][pt.y];
+                        succ[i][j] = succ[pt.x][pt.y];
+                }
+                if(i==parent[j]) preo[j] = N+1-position[i][j];
+                __syncthreads();
+        }
+
+}
+
+int main() {
+        int parents[] = {-1, 0, 0, 1, 1, 2, 4, 4};
+        int sibling[] = {-1, 2, -1, 4, -1, -1, 7, -1};
+        int children[] = {1, 3, 5, -1, 6, -1, -1, -1};
+        int *parent, *sib, *child, *preo, *ordered, *adj;
+        ordered = (int *)malloc(sizeof(int)*N);
+        cudaMalloc((int **)&parent, sizeof(int)*N);
+        cudaMalloc((int **)&sib, sizeof(int)*N);
+        cudaMalloc((int **)&child, sizeof(int)*N);
+        cudaMalloc((int **)&preo, sizeof(int)*N);
+        cudaMalloc((int **)&adj, sizeof(int)*N*N);
+        int adjacency[N][N];
+        memset(adjacency, 0, sizeof(adjacency));
+        for(int i=0; i<N; i++) {
+                for(int j=0; j<N; j++) {
+                        if(parents[j]!=-1 && parents[j]==i) {
+                                adjacency[i][j] = 1;
+                                adjacency[j][i] = 1;
+                        }
+                }
+        }
+        cudaMemcpy(parent, parents, sizeof(int)*N, cudaMemcpyHostToDevice);
+        cudaMemcpy(sib, sibling, sizeof(int)*N, cudaMemcpyHostToDevice);
+        cudaMemcpy(child, children, sizeof(int)*N, cudaMemcpyHostToDevice);
+        cudaMemcpy(adj, adjacency, sizeof(int)*N*N, cudaMemcpyHostToDevice);
+        dim3 grid(1);
+        dim3 block(N, N);
+        preorder<<<grid, block>>>(parent, sib, child, adj, preo);
+        cudaMemcpy(ordered, preo, sizeof(int)*N, cudaMemcpyDeviceToHost);
+        int preordered[N];
+        for(int i=0; i<N; i++) {
+                preordered[ordered[i]-1] = i;
+        }
+        for(int i=0; i<N; i++) {
+                printf("%d ", preordered[i]);
+        }
+        printf("\n");
+        free(ordered);
+        cudaFree(parent);
+        cudaFree(sib);
+        cudaFree(child);
+        cudaDeviceReset();
+}
+mat add/sub:
+#include<stdio.h>
+#define N 8
+__device__ struct point {
+        int x;
+        int y;
+};
+
+__device__ struct point succ[N][N];
+__device__ int position[N][N];
+
+__global__ void preorder(int *parent, int *sibling, int *child, int *adj, int *preo) {
+        int i = threadIdx.x;
+        int j = threadIdx.y;
+        int gind = j*N+i;
+        if(adj[gind]==1) {
+                 printf("Edge (%d, %d)\n",i, j);
+                if(parent[i] == j) {
+                        if(sibling[i]!=(-1)) {
+                                struct point pt;
+                                pt.x = j;
+                                pt.y = sibling[i];
+                                succ[i][j] = pt;
+                        }
+                        else if(parent[j]!=(-1)) {
+                                 struct point pt;
+                                pt.x = j;
+                                pt.y = parent[j];
+                                succ[i][j] = pt;
+                        }
+                        else {
+                                 struct point pt;
+                                pt.x = i;
+                                pt.y = j;
+                                succ[i][j] = pt;
+                                preo[j] = 1;
+                        }
+                }
+                else {
+                        if(child[j]!=(-1)) {
+                                 struct point pt;
+                                pt.x = j;
+                                pt.y = child[j];
+                                succ[i][j] = pt;
+                        }
+                        else {
+                                 struct point pt;
+                                pt.x = j;
+                                pt.y = i;
+                                succ[i][j] = pt;
+                        }
+			}
+                __syncthreads();
+                if(parent[i]==j) position[i][j] = 0;
+                else position[i][j] = 1;
+                int logval = (int)ceil(log2((double)(2*(N-1))));
+                printf("Successor of (%d, %d) = (%d, %d)\n",i, j, succ[i][j].x, succ[i][j].y);
+
+                for(int k=1; k<=logval; k++) {
+                        __syncthreads();
+                        struct point pt = succ[i][j];
+                        position[i][j] = position[i][j]+position[pt.x][pt.y];
+                        succ[i][j] = succ[pt.x][pt.y];
+                }
+                if(i==parent[j]) preo[j] = N+1-position[i][j];
+                __syncthreads();
+        }
+
+}
+
+int main() {
+        int parents[] = {-1, 0, 0, 1, 1, 2, 4, 4};
+        int sibling[] = {-1, 2, -1, 4, -1, -1, 7, -1};
+        int children[] = {1, 3, 5, -1, 6, -1, -1, -1};
+        int *parent, *sib, *child, *preo, *ordered, *adj;
+        ordered = (int *)malloc(sizeof(int)*N);
+        cudaMalloc((int **)&parent, sizeof(int)*N);
+        cudaMalloc((int **)&sib, sizeof(int)*N);
+        cudaMalloc((int **)&child, sizeof(int)*N);
+        cudaMalloc((int **)&preo, sizeof(int)*N);
+        cudaMalloc((int **)&adj, sizeof(int)*N*N);
+        int adjacency[N][N];
+        memset(adjacency, 0, sizeof(adjacency));
+        for(int i=0; i<N; i++) {
+                for(int j=0; j<N; j++) {
+                        if(parents[j]!=-1 && parents[j]==i) {
+                                adjacency[i][j] = 1;
+                                adjacency[j][i] = 1;
+                        }
+                }
+        }
+        cudaMemcpy(parent, parents, sizeof(int)*N, cudaMemcpyHostToDevice);
+        cudaMemcpy(sib, sibling, sizeof(int)*N, cudaMemcpyHostToDevice);
+        cudaMemcpy(child, children, sizeof(int)*N, cudaMemcpyHostToDevice);
+        cudaMemcpy(adj, adjacency, sizeof(int)*N*N, cudaMemcpyHostToDevice);
+        dim3 grid(1);
+        dim3 block(N, N);
+        preorder<<<grid, block>>>(parent, sib, child, adj, preo);
+        cudaMemcpy(ordered, preo, sizeof(int)*N, cudaMemcpyDeviceToHost);
+        int preordered[N];
+        for(int i=0; i<N; i++) {
+                preordered[ordered[i]-1] = i;
+        }
+        for(int i=0; i<N; i++) {
+                printf("%d ", preordered[i]);
+        }
+        printf("\n");
+        free(ordered);
+        cudaFree(parent);
+        cudaFree(sib);
+        cudaFree(child);
+        cudaDeviceReset();
+}
+string:
+#include<stdio.h>
+#define N 8
+__device__ struct point {
+        int x;
+        int y;
+};
+
+__device__ struct point succ[N][N];
+__device__ int position[N][N];
+
+__global__ void preorder(int *parent, int *sibling, int *child, int *adj, int *preo) {
+        int i = threadIdx.x;
+        int j = threadIdx.y;
+        int gind = j*N+i;
+        if(adj[gind]==1) {
+                 printf("Edge (%d, %d)\n",i, j);
+                if(parent[i] == j) {
+                        if(sibling[i]!=(-1)) {
+                                struct point pt;
+                                pt.x = j;
+                                pt.y = sibling[i];
+                                succ[i][j] = pt;
+                        }
+                        else if(parent[j]!=(-1)) {
+                                 struct point pt;
+                                pt.x = j;
+                                pt.y = parent[j];
+                                succ[i][j] = pt;
+                        }
+                        else {
+                                 struct point pt;
+                                pt.x = i;
+                                pt.y = j;
+                                succ[i][j] = pt;
+                                preo[j] = 1;
+                        }
+                }
+                else {
+                        if(child[j]!=(-1)) {
+                                 struct point pt;
+                                pt.x = j;
+                                pt.y = child[j];
+                                succ[i][j] = pt;
+                        }
+                        else {
+                                 struct point pt;
+                                pt.x = j;
+                                pt.y = i;
+                                succ[i][j] = pt;
+                        }
+			}
+                __syncthreads();
+                if(parent[i]==j) position[i][j] = 0;
+                else position[i][j] = 1;
+                int logval = (int)ceil(log2((double)(2*(N-1))));
+                printf("Successor of (%d, %d) = (%d, %d)\n",i, j, succ[i][j].x, succ[i][j].y);
+
+                for(int k=1; k<=logval; k++) {
+                        __syncthreads();
+                        struct point pt = succ[i][j];
+                        position[i][j] = position[i][j]+position[pt.x][pt.y];
+                        succ[i][j] = succ[pt.x][pt.y];
+                }
+                if(i==parent[j]) preo[j] = N+1-position[i][j];
+                __syncthreads();
+        }
+
+}
+
+int main() {
+        int parents[] = {-1, 0, 0, 1, 1, 2, 4, 4};
+        int sibling[] = {-1, 2, -1, 4, -1, -1, 7, -1};
+        int children[] = {1, 3, 5, -1, 6, -1, -1, -1};
+        int *parent, *sib, *child, *preo, *ordered, *adj;
+        ordered = (int *)malloc(sizeof(int)*N);
+        cudaMalloc((int **)&parent, sizeof(int)*N);
+        cudaMalloc((int **)&sib, sizeof(int)*N);
+        cudaMalloc((int **)&child, sizeof(int)*N);
+        cudaMalloc((int **)&preo, sizeof(int)*N);
+        cudaMalloc((int **)&adj, sizeof(int)*N*N);
+        int adjacency[N][N];
+        memset(adjacency, 0, sizeof(adjacency));
+        for(int i=0; i<N; i++) {
+                for(int j=0; j<N; j++) {
+                        if(parents[j]!=-1 && parents[j]==i) {
+                                adjacency[i][j] = 1;
+                                adjacency[j][i] = 1;
+                        }
+                }
+        }
+        cudaMemcpy(parent, parents, sizeof(int)*N, cudaMemcpyHostToDevice);
+        cudaMemcpy(sib, sibling, sizeof(int)*N, cudaMemcpyHostToDevice);
+        cudaMemcpy(child, children, sizeof(int)*N, cudaMemcpyHostToDevice);
+        cudaMemcpy(adj, adjacency, sizeof(int)*N*N, cudaMemcpyHostToDevice);
+        dim3 grid(1);
+        dim3 block(N, N);
+        preorder<<<grid, block>>>(parent, sib, child, adj, preo);
+        cudaMemcpy(ordered, preo, sizeof(int)*N, cudaMemcpyDeviceToHost);
+        int preordered[N];
+        for(int i=0; i<N; i++) {
+                preordered[ordered[i]-1] = i;
+        }
+        for(int i=0; i<N; i++) {
+                printf("%d ", preordered[i]);
+        }
+        printf("\n");
+        free(ordered);
+        cudaFree(parent);
+        cudaFree(sib);
+        cudaFree(child);
+        cudaDeviceReset();
+}
+enum sort:
+#include<stdio.h>
+#define N 8
+__device__ struct point {
+        int x;
+        int y;
+};
+
+__device__ struct point succ[N][N];
+__device__ int position[N][N];
+
+__global__ void preorder(int *parent, int *sibling, int *child, int *adj, int *preo) {
+        int i = threadIdx.x;
+        int j = threadIdx.y;
+        int gind = j*N+i;
+        if(adj[gind]==1) {
+                 printf("Edge (%d, %d)\n",i, j);
+                if(parent[i] == j) {
+                        if(sibling[i]!=(-1)) {
+                                struct point pt;
+                                pt.x = j;
+                                pt.y = sibling[i];
+                                succ[i][j] = pt;
+                        }
+                        else if(parent[j]!=(-1)) {
+                                 struct point pt;
+                                pt.x = j;
+                                pt.y = parent[j];
+                                succ[i][j] = pt;
+                        }
+                        else {
+                                 struct point pt;
+                                pt.x = i;
+                                pt.y = j;
+                                succ[i][j] = pt;
+                                preo[j] = 1;
+                        }
+                }
+                else {
+                        if(child[j]!=(-1)) {
+                                 struct point pt;
+                                pt.x = j;
+                                pt.y = child[j];
+                                succ[i][j] = pt;
+                        }
+                        else {
+                                 struct point pt;
+                                pt.x = j;
+                                pt.y = i;
+                                succ[i][j] = pt;
+                        }
+			}
+                __syncthreads();
+                if(parent[i]==j) position[i][j] = 0;
+                else position[i][j] = 1;
+                int logval = (int)ceil(log2((double)(2*(N-1))));
+                printf("Successor of (%d, %d) = (%d, %d)\n",i, j, succ[i][j].x, succ[i][j].y);
+
+                for(int k=1; k<=logval; k++) {
+                        __syncthreads();
+                        struct point pt = succ[i][j];
+                        position[i][j] = position[i][j]+position[pt.x][pt.y];
+                        succ[i][j] = succ[pt.x][pt.y];
+                }
+                if(i==parent[j]) preo[j] = N+1-position[i][j];
+                __syncthreads();
+        }
+
+}
+
+int main() {
+        int parents[] = {-1, 0, 0, 1, 1, 2, 4, 4};
+        int sibling[] = {-1, 2, -1, 4, -1, -1, 7, -1};
+        int children[] = {1, 3, 5, -1, 6, -1, -1, -1};
+        int *parent, *sib, *child, *preo, *ordered, *adj;
+        ordered = (int *)malloc(sizeof(int)*N);
+        cudaMalloc((int **)&parent, sizeof(int)*N);
+        cudaMalloc((int **)&sib, sizeof(int)*N);
+        cudaMalloc((int **)&child, sizeof(int)*N);
+        cudaMalloc((int **)&preo, sizeof(int)*N);
+        cudaMalloc((int **)&adj, sizeof(int)*N*N);
+        int adjacency[N][N];
+        memset(adjacency, 0, sizeof(adjacency));
+        for(int i=0; i<N; i++) {
+                for(int j=0; j<N; j++) {
+                        if(parents[j]!=-1 && parents[j]==i) {
+                                adjacency[i][j] = 1;
+                                adjacency[j][i] = 1;
+                        }
+                }
+        }
+        cudaMemcpy(parent, parents, sizeof(int)*N, cudaMemcpyHostToDevice);
+        cudaMemcpy(sib, sibling, sizeof(int)*N, cudaMemcpyHostToDevice);
+        cudaMemcpy(child, children, sizeof(int)*N, cudaMemcpyHostToDevice);
+        cudaMemcpy(adj, adjacency, sizeof(int)*N*N, cudaMemcpyHostToDevice);
+        dim3 grid(1);
+        dim3 block(N, N);
+        preorder<<<grid, block>>>(parent, sib, child, adj, preo);
+        cudaMemcpy(ordered, preo, sizeof(int)*N, cudaMemcpyDeviceToHost);
+        int preordered[N];
+        for(int i=0; i<N; i++) {
+                preordered[ordered[i]-1] = i;
+        }
+        for(int i=0; i<N; i++) {
+                printf("%d ", preordered[i]);
+        }
+        printf("\n");
+        free(ordered);
+        cudaFree(parent);
+        cudaFree(sib);
+        cudaFree(child);
+        cudaDeviceReset();
+}
+MPI:
+CHAT SERVER:
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char** argv) {
+  const int PING_PONG_LIMIT = 10;
+
+  // Initialize the MPI environment
+  MPI_Init(NULL, NULL);
+  // Find out rank, size
+  int world_rank;
+  MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+  int world_size;
+  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+  // We are assuming 2 processes for this task
+  if (world_size != 2) {
+    fprintf(stderr, "World size must be two for %s\n", argv[0]);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+
+  int ping_pong_count = 0;
+  int partner_rank = (world_rank + 1) % 2;
+  while (ping_pong_count < PING_PONG_LIMIT) {
+    if (world_rank == ping_pong_count % 2) {
+      // Increment the ping pong count before you send it
+      ping_pong_count++;
+      MPI_Send(&ping_pong_count, 1, MPI_INT, partner_rank, 0, MPI_COMM_WORLD);
+      printf("%d sent and incremented ping_pong_count %d to %d\n",
+             world_rank, ping_pong_count, partner_rank);
+    } else {
+      MPI_Recv(&ping_pong_count, 1, MPI_INT, partner_rank, 0, MPI_COMM_WORLD,
+               MPI_STATUS_IGNORE);
+      printf("%d received ping_pong_count %d from %d\n",
+             world_rank, ping_pong_count, partner_rank);
+    }
+  }
+  MPI_Finalize();
+}
+GROUP COMMUNICATION:
+CSE411 - PDS LAB -2022C
+Material details
+MPI
+Prof. ANANTHAKRISHNAN .S Sethuraman
+•
+Oct 21 (Edited Nov 24)
+MPI_Sum of N numbers.pdf
+PDF
+MPI_Introduction.ppt
+PowerPoint
+byzantine output.txt
+Text
+byzantine.txt
+Text
+Chat Server.txt
+Text
+Clock Synchronization.txt
+Text
+Group Communication.txt
+Text
+mutual exclusion and leader election.txt
+Text
+Class comments
+
+GROUP COMMUNICATION
+
+Broadcast
+
+#include <mpi.h>
+#include <stdio.h>
+
+int main(int argc, char** argv) {
+        int rank;
+        int buf;
+        const int root=0;
+
+        MPI_Init(&argc, &argv);
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+        if(rank == root) {
+           buf = 777;
+        }
+
+        printf("[%d]: Before Bcast, buf is %d\n", rank, buf);
+
+        /* everyone calls bcast, data is taken from root and ends up in everyone's buf */
+        MPI_Bcast(&buf, 1, MPI_INT, root, MPI_COMM_WORLD);
+
+        printf("[%d]: After Bcast, buf is %d\n", rank, buf);
+
+        MPI_Finalize();
+        return 0;
+}
+
+------------------------------------------------------------------------
+Scatter 
+
+#include "mpi.h"
+#include <stdio.h>
+#define SIZE 4
+
+main(int argc, char *argv[])  {
+int numtasks, rank, sendcount, recvcount, source;
+float sendbuf[SIZE][SIZE] = {
+  {1.0, 2.0, 3.0, 4.0},
+  {5.0, 6.0, 7.0, 8.0},
+  {9.0, 10.0, 11.0, 12.0},
+  {13.0, 14.0, 15.0, 16.0}  };
+float recvbuf[SIZE];
+
+MPI_Init(&argc,&argv);
+MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+MPI_Comm_size(MPI_COMM_WORLD, &numtasks);
+
+if (numtasks == SIZE) {
+  source = 1;
+  sendcount = SIZE;
+  recvcount = SIZE;
+  MPI_Scatter(sendbuf,sendcount,MPI_FLOAT,recvbuf,recvcount,
+             MPI_FLOAT,source,MPI_COMM_WORLD);
+
+  printf("rank= %d  Results: %f %f %f %f\n",rank,recvbuf[0],
+         recvbuf[1],recvbuf[2],recvbuf[3]);
+  }
+else
+  printf("Must specify %d processors. Terminating.\n",SIZE);
+
+MPI_Finalize();
+}
+
+Reduce:
+
+#include "mpi.h"
+#include <stdio.h>
+#include <stdlib.h>
+ 
+/* A simple test of Reduce with all choices of root process */
+int main( int argc, char *argv[] )
+{
+    int errs = 0;
+    int rank, size, root;
+    int *sendbuf, *recvbuf, i;
+    int minsize = 2, count;
+    MPI_Comm comm;
+ 
+    MPI_Init( &argc, &argv );
+ 
+    comm = MPI_COMM_WORLD;
+    /* Determine the sender and receiver */
+    MPI_Comm_rank( comm, &rank );
+    MPI_Comm_size( comm, &size );
+ 
+    for (count = 1; count < 130000; count = count * 2) {
+        sendbuf = (int *)malloc( count * sizeof(int) );
+        recvbuf = (int *)malloc( count * sizeof(int) );
+        for (root = 0; root < size; root ++) {
+            for (i=0; i<count; i++) sendbuf[i] = i;
+            for (i=0; i<count; i++) recvbuf[i] = -1;
+            MPI_Reduce( sendbuf, recvbuf, count, MPI_INT, MPI_SUM, root, comm );
+            if (rank == root) {
+                for (i=0; i<count; i++) {
+                    if (recvbuf[i] != i * size) {
+                        errs++;
+                    }
+                }
+            }
+        }
+        free( sendbuf );
+        free( recvbuf );
+    }
+ 
+    MPI_Finalize();
+    return errs;
+}
+//Mutual Exclusion
+
+#include <stdio.h> 
+#include <mpi.h> 
+int main(int argc, char **argv) 
+{ 
+int size, rank; 
+MPI_Init(&argc, &argv); 
+MPI_Comm_size(MPI_COMM_WORLD, &size); 
+MPI_Comm_rank(MPI_COMM_WORLD, &rank); 
+int shared = 0; 
+if (rank == 0) 
+{ 
+int queue[10]; 
+for (int j = 0; j < 10; j++) 
+queue[j] = 0; 
+int front = 0; 
+int rear = -1; 
+int count = 0; 
+int lock = 0; 
+int process; 
+MPI_Status st; 
+while (1) 
+{ 
+MPI_Recv(&process, 1, MPI_INT, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &st); if (st.MPI_SOURCE == 0) 
+break; 
+printf("Queue has "); 
+for (int j = front; j < 6; j++) 
+{ 
+if (queue[j] == 0) 
+break; 
+printf("%d ", queue[j]); 
+} 
+printf("\n"); 
+if (st.MPI_TAG == 3) 
+{ 
+shared = process; 
+int send = queue[front++]; 
+count--; 
+printf("Process %d changed value is %d\n", st.MPI_SOURCE, shared); 
+if (send == 0) 
+break; 
+printf("Process %d acquired shared resource\n", send);
+MPI_Send(&shared, 1, MPI_INT, send, 2, MPI_COMM_WORLD); 
+} 
+if (st.MPI_TAG == 1) 
+{ 
+if (lock == 0 && count == 0) 
+{ 
+lock = 1; 
+printf("Process %d acquired shared resource\n", process); 
+MPI_Send(&shared, 1, MPI_INT, process, 2, MPI_COMM_WORLD); 
+} 
+else 
+{ 
+queue[++rear] = process; 
+count++; 
+} 
+} 
+} 
+} 
+else 
+{ 
+MPI_Send(&rank, 1, MPI_INT, 0, 1, MPI_COMM_WORLD); 
+MPI_Status st; 
+int recv; 
+MPI_Recv(&shared, 1, MPI_INT, 0, 2, MPI_COMM_WORLD, &st); 
+if (st.MPI_TAG == 2) 
+{ 
+int before = shared; 
+shared++; 
+printf("Process %d, Before altering %d; After altering %d\n", rank, before,  shared); 
+MPI_Send(&shared, 1, MPI_INT, 0, 3, MPI_COMM_WORLD); 
+} 
+} 
+MPI_Finalize(); 
+}
+
+
+
+
+//Leader election
+#include <stdlib.h> 
+#include <stdio.h> 
+#include "mpi.h" 
+void main(int argc, char *argv[]) 
+{ 
+MPI_Init(&argc, &argv); 
+int rank, size, recv, uid, next, prev, round = 1; 
+MPI_Comm_rank(MPI_COMM_WORLD, &rank); 
+MPI_Comm_size(MPI_COMM_WORLD, &size); 
+MPI_Status st; 
+//1.Generate uid
+uid = (rand() * (rank + 1) * size) % 100; 
+if (uid < 0) 
+uid = uid + 100; 
+printf("HI! I am rank %d uid %d\n", rank, uid); 
+//2.Determine next and prev
+next = (rank == size - 1 ? 0 : rank + 1); 
+prev = (rank == 0 ? size - 1 : rank - 1); 
+//3.Send uid to next with round no. as 1
+MPI_Send(&uid, 1, MPI_INT, next, round, MPI_COMM_WORLD); 
+while (1) 
+{ 
+	//4.Recv uid from prev and check the tag. If tag equal to 201, send 201 to next and terminate. Else check uid and decide to declare as leader(if recv==uid) or send the recv to next process(if recv>uid) by incrementing the round number.
+
+
+MPI_Recv(&recv, 1, MPI_INT, prev, MPI_ANY_TAG, MPI_COMM_WORLD, &st); 
+if (st.MPI_TAG == 201) 
+{ 
+MPI_Send(&recv, 1, MPI_INT, next, 201, MPI_COMM_WORLD); 
+break; 
+} 
+else 
+{ 
+round = st.MPI_TAG; 
+printf("Round %d:My rank %d recieved %d\n", round, rank, recv); 
+if (recv == uid) 
+{ 
+printf("I am the leader...Rank %d uid:%d round %d \n", rank, uid, round);
+MPI_Send(&rank, 1, MPI_INT, next, 201, MPI_COMM_WORLD); 
+break; 
+} 
+if (recv > uid) 
+{ 
+MPI_Send(&recv, 1, MPI_INT, next, round + 1, MPI_COMM_WORLD); 
+} 
+} 
+} 
+MPI_Finalize(); 
+} 
+// Run with only 3 process
+#include<stdio.h>
+#include<mpi.h>
+
+main(int argc,char *argv[])
+{
+        int rank,size,hr,min,rhr,rmin,diff1,diff2;
+        MPI_Init(&argc,&argv);
+        MPI_Comm_size(MPI_COMM_WORLD,&size);
+        MPI_Comm_rank(MPI_COMM_WORLD,&rank);
+        MPI_Status st;
+
+        if(rank==0)
+        {
+                hr=3;
+                min=10;
+                rhr=hr;
+                rmin=min;
+        }
+
+        else if(rank==1)
+        {
+                hr=3;
+                min=0;
+        }
+        else if(rank==2)
+        {
+                hr=3;
+                min=35;
+        }
+        printf("Before Synchronization RANK : %d \t hr : %d \t min :%d \t",rank,hr,min);
+        MPI_Bcast(&rhr,1,MPI_INT,0,MPI_COMM_WORLD);
+        MPI_Bcast(&rmin,1,MPI_INT,0,MPI_COMM_WORLD);
+        if(rank==0)
+        {
+                MPI_Recv(&diff1,1,MPI_INT,1,1,MPI_COMM_WORLD,&st);
+                MPI_Recv(&diff2,1,MPI_INT,2,2,MPI_COMM_WORLD,&st);
+                int send=(diff1+diff2)/3;
+                min=min+send;
+                if(min>60)
+                {
+                        hr++;
+                        min=min%60;
+                }
+                else if(min<0)
+                {
+                        hr--;
+                        min=min%60;
+                }
+                diff1=send-diff1;
+                diff2=send-diff2;
+
+
+
+                MPI_Send(&diff1,1,MPI_INT,1,5,MPI_COMM_WORLD);
+                MPI_Send(&diff2,1,MPI_INT,2,6,MPI_COMM_WORLD);
+        }
+
+
+
+        else if(rank==1)
+        {
+                diff1=(hr-rhr)*60+(min-rmin);
+                MPI_Send(&diff1,1,MPI_INT,0,1,MPI_COMM_WORLD);
+                MPI_Recv(&diff1,1,MPI_INT,0,5,MPI_COMM_WORLD,&st);
+                min=min+diff1;
+                if(min>60)
+                {
+                        hr++;
+                        min=min%60;
+                }
+                else if(min<0)
+                {
+                        hr--;
+                        min=min%60;
+                }
+        }
+        else if(rank==2)
+        {
+                diff2=(hr-rhr)*60+(min-rmin);
+                MPI_Send(&diff2,1,MPI_INT,0,2,MPI_COMM_WORLD);
+                MPI_Recv(&diff2,1,MPI_INT,0,6,MPI_COMM_WORLD,&st);
+                min=min+diff2;
+                if(min>60)
+                {
+                        hr++;
+                        min=min%60;
+                }
+                else if(min<0)
+                {
+                        hr--;
+                        min=min%60;
+                }
+
+        }
+
+   printf("After Synchronization RANK : %d \t hr : %d \t min : %d \n",rank,hr,min);
+
+   MPI_Finalize();
+ }
+BYZANTINE:
+#include<stdio.h>
+#include<mpi.h>
+void main(int argc,char* argv[]){
+int rank,size,i,j,r,k,count,faulty=0,majorityValue;
+MPI_Init(&argc,&argv);
+MPI_Comm_size(MPI_COMM_WORLD,&size);
+MPI_Comm_rank(MPI_COMM_WORLD,&rank);
+MPI_Status st;
+if(rank==2||rank==5)
+faulty=1;
+if(faulty==1)
+printf("i am rank %d Faulty..find me  \n",rank);
+int recv[size];
+if(faulty!=1){
+        for(i=0;i<size;i++){
+                if(i!=rank){
+                        MPI_Send(&rank,1,MPI_INT,i,101,MPI_COMM_WORLD);
+                }
+        }
+        for(i=0;i<size;i++){
+                if(i==rank)
+                        recv[i]=rank;
+                else{
+                        MPI_Recv(&recv[i],1,MPI_INT,i,101,MPI_COMM_WORLD,&st);
+                }
+        }
+}
+else if(faulty==1){
+        for(i=0;i<size;i++){
+                if(i!=rank){
+                        r=(rand()+r*r)%100;
+                        MPI_Send(&r,1,MPI_INT,i,101,MPI_COMM_WORLD);
+                }
+        }
+        for(i=0;i<size;i++){ 
+                if(i==rank)
+                        recv[i]=rank;
+                else{
+                        MPI_Recv(&recv[i],1,MPI_INT,i,101,MPI_COMM_WORLD,&st);
+                }
+        }
+        for(i=0;i<size;i++)
+                        recv[i]=(rand()+r*r)%100;
+}
+
+for(i=0;i<size;i++)
+        if(i!=rank)
+                MPI_Send(recv,size,MPI_INT,i,201,MPI_COMM_WORLD);
+int vect[size][size];
+for(i=0;i<size-1;i++)
+                MPI_Recv(vect[i],size,MPI_INT,MPI_ANY_SOURCE,201,MPI_COMM_WORLD,&st);
+for(i=0;i<size;i++){
+        for(j=0;j<size-1;j++){
+                count=0;
+                majorityValue=vect[j][i];
+                for(k=0;k<size-1;k++){
+                        if(vect[k][i]==majorityValue)
+                                count++;
+                        else
+                                count--;
+                }
+                if(count>0){
+                        break;
+                }
+        }
+        if(j==size-1)
+                printf("%d says %d is Faulty\n",rank,i);
+}
+MPI_Finalize();
+}
+
+
+
+
+
+
+
+
+
+
